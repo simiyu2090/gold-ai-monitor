@@ -29,6 +29,11 @@ INTERVAL = "5"
 CANDLE_LIMIT = 300
 BINANCE_FAPI = "https://fapi.binance.com"
 BINANCE_GOLD_SYMBOL = "PAXGUSDT"
+OKX_BASE = "https://www.okx.com"
+OKX_INST_SWAP = "XAUT-USDT-SWAP"
+OKX_INST_SPOT = "XAUT-USDT"
+COINBASE_BASE = "https://api.exchange.coinbase.com"
+COINBASE_PRODUCT = "PAXG-USD"
 REQUEST_HEADERS = {
     "Accept": "application/json",
     "User-Agent": (
@@ -51,6 +56,29 @@ BINANCE_INTERVALS = {
     "W": "1w",
     "M": "1M",
 }
+OKX_BARS = {
+    "1": "1m",
+    "3": "3m",
+    "5": "5m",
+    "15": "15m",
+    "30": "30m",
+    "60": "1H",
+    "120": "2H",
+    "240": "4H",
+    "360": "6H",
+    "720": "12H",
+    "D": "1D",
+    "W": "1W",
+    "M": "1M",
+}
+COINBASE_GRANULARITY = {
+    "5": 300,
+    "15": 900,
+    "30": 900,
+    "60": 3600,
+    "240": 21600,
+    "D": 86400,
+}
 _active_vendor = "bybit"
 
 st.set_page_config(
@@ -62,6 +90,196 @@ st.set_page_config(
 
 st.title("Gold AI Market Monitor")
 st.caption("Bybit | XAUTUSDT Perpetual | Market analysis only")
+
+def public_json(url, params=None):
+    response = requests.get(
+        url,
+        params=params,
+        headers=REQUEST_HEADERS,
+        timeout=15,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def fallback_instrument(
+    symbol,
+    contract_type,
+    status,
+    base_coin,
+    quote_coin,
+    settle_coin,
+    tick_size="0.01",
+    qty_step="0.001",
+):
+    return {
+        "list": [{
+            "symbol": symbol,
+            "contractType": contract_type,
+            "status": status,
+            "baseCoin": base_coin,
+            "quoteCoin": quote_coin,
+            "settleCoin": settle_coin,
+            "priceFilter": {"tickSize": tick_size},
+            "lotSizeFilter": {"qtyStep": qty_step},
+        }]
+    }
+
+
+def okx_market_result(endpoint, params):
+    """Bybit-shaped public data from OKX XAUT (swap, then spot)."""
+    params = params or {}
+
+    def load_inst():
+        for inst_id, inst_type in (
+            (OKX_INST_SWAP, "SWAP"),
+            (OKX_INST_SPOT, "SPOT"),
+        ):
+            payload = public_json(
+                f"{OKX_BASE}/api/v5/public/instruments",
+                {"instType": inst_type, "instId": inst_id},
+            )
+            rows = payload.get("data") or []
+            if payload.get("code") == "0" and rows:
+                return rows[0]
+        raise RuntimeError("OKX did not return an XAUT instrument.")
+
+    instrument = load_inst()
+    inst_id = instrument.get("instId") or OKX_INST_SPOT
+
+    if endpoint == "/v5/market/instruments-info":
+        is_swap = instrument.get("instType") == "SWAP"
+        status = (
+            "Trading"
+            if instrument.get("state") == "live"
+            else instrument.get("state")
+        )
+        return fallback_instrument(
+            symbol=inst_id,
+            contract_type="LinearPerpetual" if is_swap else "Spot",
+            status=status,
+            base_coin=instrument.get("baseCcy") or "XAUT",
+            quote_coin=instrument.get("quoteCcy") or "USDT",
+            settle_coin=instrument.get("settleCcy") or instrument.get("quoteCcy") or "USDT",
+            tick_size=str(instrument.get("tickSz") or "0.1"),
+            qty_step=str(instrument.get("lotSz") or "0.001"),
+        )
+
+    if endpoint == "/v5/market/tickers":
+        payload = public_json(
+            f"{OKX_BASE}/api/v5/market/ticker",
+            {"instId": inst_id},
+        )
+        rows = payload.get("data") or []
+        if payload.get("code") != "0" or not rows:
+            raise RuntimeError(payload.get("msg") or "OKX ticker failed.")
+        return {"list": [{"lastPrice": rows[0].get("last")}]}
+
+    if endpoint == "/v5/market/kline":
+        bar = OKX_BARS.get(str(params.get("interval", INTERVAL)), "5m")
+        payload = public_json(
+            f"{OKX_BASE}/api/v5/market/candles",
+            {
+                "instId": inst_id,
+                "bar": bar,
+                "limit": str(params.get("limit", CANDLE_LIMIT)),
+            },
+        )
+        rows = payload.get("data") or []
+        if payload.get("code") != "0":
+            raise RuntimeError(payload.get("msg") or "OKX candles failed.")
+        converted = []
+        for candle in rows:
+            converted.append([
+                candle[0],
+                candle[1],
+                candle[2],
+                candle[3],
+                candle[4],
+                candle[5],
+                candle[7] if len(candle) > 7 else candle[5],
+            ])
+        return {"list": converted}
+
+    if endpoint == "/v5/market/orderbook":
+        payload = public_json(
+            f"{OKX_BASE}/api/v5/market/books",
+            {"instId": inst_id, "sz": "100"},
+        )
+        rows = payload.get("data") or []
+        if payload.get("code") != "0" or not rows:
+            raise RuntimeError(payload.get("msg") or "OKX order book failed.")
+        book = rows[0]
+        return {
+            "b": [[level[0], level[1]] for level in book.get("bids", [])],
+            "a": [[level[0], level[1]] for level in book.get("asks", [])],
+        }
+
+    raise RuntimeError(f"No OKX fallback is defined for {endpoint}.")
+
+
+def coinbase_market_result(endpoint, params):
+    """Bybit-shaped public data from Coinbase PAXG-USD spot."""
+    params = params or {}
+    product = COINBASE_PRODUCT
+
+    if endpoint == "/v5/market/instruments-info":
+        item = public_json(f"{COINBASE_BASE}/products/{product}")
+        status = (
+            "Trading"
+            if item.get("status") == "online"
+            else item.get("status")
+        )
+        return fallback_instrument(
+            symbol=item.get("id") or product,
+            contract_type="Spot",
+            status=status,
+            base_coin=item.get("base_currency") or "PAXG",
+            quote_coin=item.get("quote_currency") or "USD",
+            settle_coin=item.get("quote_currency") or "USD",
+            tick_size=str(item.get("quote_increment") or "0.01"),
+            qty_step=str(item.get("base_increment") or "0.0001"),
+        )
+
+    if endpoint == "/v5/market/tickers":
+        ticker = public_json(f"{COINBASE_BASE}/products/{product}/ticker")
+        return {"list": [{"lastPrice": ticker.get("price")}]}
+
+    if endpoint == "/v5/market/kline":
+        granularity = COINBASE_GRANULARITY.get(
+            str(params.get("interval", INTERVAL)),
+            300,
+        )
+        candles = public_json(
+            f"{COINBASE_BASE}/products/{product}/candles",
+            {"granularity": granularity},
+        )
+        rows = []
+        for candle in sorted(candles, key=lambda row: int(row[0]), reverse=True):
+            open_ms = int(candle[0]) * 1000
+            rows.append([
+                open_ms,
+                candle[3],
+                candle[2],
+                candle[1],
+                candle[4],
+                candle[5],
+                candle[5],
+            ])
+        return {"list": rows}
+
+    if endpoint == "/v5/market/orderbook":
+        book = public_json(
+            f"{COINBASE_BASE}/products/{product}/book",
+            {"level": 2},
+        )
+        return {
+            "b": [[level[0], level[1]] for level in book.get("bids", [])[:100]],
+            "a": [[level[0], level[1]] for level in book.get("asks", [])[:100]],
+        }
+
+    raise RuntimeError(f"No Coinbase fallback is defined for {endpoint}.")
+
 
 def binance_market_result(endpoint, params):
     """Return Bybit-shaped public data from Binance USDT-M gold futures.
@@ -220,16 +438,26 @@ def api_get(endpoint, params):
             last_error = exc
             continue
 
-    try:
-        result = binance_market_result(endpoint, params)
-        _active_vendor = "binance"
-        return result
-    except Exception as exc:
-        raise RuntimeError(
-            "Bybit blocked this host with HTTP 403 (common on "
-            "Streamlit Cloud / US IPs), and the Binance gold "
-            f"fallback also failed: {exc}"
-        ) from last_error
+    fallbacks = (
+        ("okx", okx_market_result),
+        ("coinbase", coinbase_market_result),
+        ("binance", binance_market_result),
+    )
+    fallback_errors = []
+    for vendor, loader in fallbacks:
+        try:
+            result = loader(endpoint, params)
+            _active_vendor = vendor
+            return result
+        except Exception as exc:
+            fallback_errors.append(f"{vendor}: {exc}")
+
+    details = "; ".join(fallback_errors) or str(last_error)
+    raise RuntimeError(
+        "Bybit blocked this host with HTTP 403 (common on "
+        "Streamlit Cloud / US IPs), and every gold fallback "
+        f"failed ({details})."
+    ) from last_error
 
 
 def get_instrument():
@@ -246,7 +474,8 @@ def get_instrument():
         )
 
     instrument = instruments[0] or {}
-    if instrument.get("contractType") != "LinearPerpetual":
+    allowed_types = ("LinearPerpetual", "Spot")
+    if instrument.get("contractType") not in allowed_types:
         raise RuntimeError(
             f"Wrong contract type: "
             f"{instrument.get('contractType')}"
@@ -258,13 +487,12 @@ def get_instrument():
             f"Status: {instrument.get('status')}"
         )
 
-    if (
-        instrument.get("quoteCoin") != "USDT"
-        or instrument.get("settleCoin") != "USDT"
-    ):
+    quote = instrument.get("quoteCoin")
+    settle = instrument.get("settleCoin")
+    if quote not in ("USDT", "USD") or settle not in ("USDT", "USD"):
         raise RuntimeError(
             "The contract's quote or settlement currency "
-            "is not USDT."
+            "is not USDT or USD."
         )
 
     return instrument
@@ -1154,12 +1382,30 @@ def render_market():
             ticker = get_ticker()
             candles = add_indicators(get_candles())
 
-        if _active_vendor == "binance":
+        live_symbol = str(instrument.get("symbol") or "")
+        using_fallback = (
+            _active_vendor != "bybit"
+            or live_symbol not in (SYMBOL, "")
+        )
+        if using_fallback:
+            vendor_labels = {
+                "okx": "OKX XAUT public data",
+                "coinbase": "Coinbase PAXG-USD public data",
+                "binance": "Binance PAXGUSDT public data",
+            }
+            if _active_vendor in vendor_labels:
+                vendor_name = vendor_labels[_active_vendor]
+            elif "XAUT" in live_symbol:
+                vendor_name = f"OKX {live_symbol} public data"
+            elif live_symbol == "PAXG-USD":
+                vendor_name = "Coinbase PAXG-USD public data"
+            else:
+                vendor_name = f"{live_symbol} public data"
             st.warning(
                 "Bybit returned HTTP 403 from this host, so the dashboard "
-                "is using Binance USDT-M **PAXGUSDT** public data instead. "
-                "Bybit blocks many US and cloud IPs. Your Windows copy can "
-                "still use Bybit XAUTUSDT when the local IP is allowed."
+                f"is using **{vendor_name}** instead. Streamlit Cloud IPs "
+                "are often blocked by Bybit and Binance. Your Windows copy "
+                "can still use Bybit XAUTUSDT when the local IP is allowed."
             )
 
         if len(candles) < 60:
