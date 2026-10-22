@@ -19,10 +19,39 @@ initialize_database()
 # 1. Application settings
 # --------------------------------------------------
 BASE_URL = "https://api.bybit.com"
+BYBIT_HOSTS = (
+    "https://api.bybit.com",
+    "https://api.bytick.com",
+)
 SYMBOL = "XAUTUSDT"
 CATEGORY = "linear"
 INTERVAL = "5"
 CANDLE_LIMIT = 300
+BINANCE_FAPI = "https://fapi.binance.com"
+BINANCE_GOLD_SYMBOL = "PAXGUSDT"
+REQUEST_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "GoldAIMonitor/1.0 "
+        "(educational dashboard; public market data only)"
+    ),
+}
+BINANCE_INTERVALS = {
+    "1": "1m",
+    "3": "3m",
+    "5": "5m",
+    "15": "15m",
+    "30": "30m",
+    "60": "1h",
+    "120": "2h",
+    "240": "4h",
+    "360": "6h",
+    "720": "12h",
+    "D": "1d",
+    "W": "1w",
+    "M": "1M",
+}
+_active_vendor = "bybit"
 
 st.set_page_config(
     page_title="Gold AI Market Monitor",
@@ -34,24 +63,173 @@ st.set_page_config(
 st.title("Gold AI Market Monitor")
 st.caption("Bybit | XAUTUSDT Perpetual | Market analysis only")
 
+def binance_market_result(endpoint, params):
+    """Return Bybit-shaped public data from Binance USDT-M gold futures.
+
+    Streamlit Cloud often uses US/cloud IPs that Bybit's CDN blocks with
+    HTTP 403. PAXGUSDT is a nearby tokenized-gold perpetual used only as
+    a fallback so the hosted dashboard can still load.
+    """
+    params = params or {}
+    symbol = BINANCE_GOLD_SYMBOL
+
+    if endpoint == "/v5/market/instruments-info":
+        response = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/exchangeInfo",
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+        match = next(
+            (
+                item for item in response.json().get("symbols", [])
+                if item.get("symbol") == symbol
+            ),
+            None,
+        )
+        if not match:
+            raise RuntimeError(
+                f"{symbol} was not found on Binance USDT-M futures."
+            )
+
+        filters = {
+            item.get("filterType"): item
+            for item in match.get("filters", [])
+        }
+        price = filters.get("PRICE_FILTER", {})
+        lot = filters.get("LOT_SIZE", {})
+        status = (
+            "Trading"
+            if match.get("status") == "TRADING"
+            else match.get("status")
+        )
+        contract_type = (
+            "LinearPerpetual"
+            if match.get("contractType") == "PERPETUAL"
+            else match.get("contractType")
+        )
+        return {
+            "list": [{
+                "symbol": match.get("symbol"),
+                "contractType": contract_type,
+                "status": status,
+                "baseCoin": match.get("baseAsset"),
+                "quoteCoin": match.get("quoteAsset"),
+                "settleCoin": match.get("marginAsset") or match.get("quoteAsset"),
+                "priceFilter": {"tickSize": price.get("tickSize")},
+                "lotSizeFilter": {"qtyStep": lot.get("stepSize")},
+            }]
+        }
+
+    if endpoint == "/v5/market/tickers":
+        response = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/ticker/24hr",
+            params={"symbol": symbol},
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+        ticker = response.json()
+        return {
+            "list": [{
+                "lastPrice": ticker.get("lastPrice"),
+            }]
+        }
+
+    if endpoint == "/v5/market/kline":
+        interval = BINANCE_INTERVALS.get(
+            str(params.get("interval", INTERVAL)),
+            "5m",
+        )
+        response = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/klines",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "limit": params.get("limit", CANDLE_LIMIT),
+            },
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+        rows = []
+        for candle in reversed(response.json()):
+            rows.append([
+                candle[0],
+                candle[1],
+                candle[2],
+                candle[3],
+                candle[4],
+                candle[5],
+                candle[7],
+            ])
+        return {"list": rows}
+
+    if endpoint == "/v5/market/orderbook":
+        response = requests.get(
+            f"{BINANCE_FAPI}/fapi/v1/depth",
+            params={"symbol": symbol, "limit": 100},
+            headers=REQUEST_HEADERS,
+            timeout=15,
+        )
+        response.raise_for_status()
+        book = response.json()
+        return {
+            "b": book.get("bids", []),
+            "a": book.get("asks", []),
+        }
+
+    raise RuntimeError(
+        f"No Binance fallback is defined for {endpoint}."
+    )
+
+
 # Public market-data requests need no API key.
 @st.cache_data(ttl=2, show_spinner=False)
 def api_get(endpoint, params):
-    response = requests.get(
-        f"{BASE_URL}{endpoint}",
-        params=params,
-        timeout=15,
-    )
-    response.raise_for_status()
-    data = response.json()
+    global _active_vendor
+    params = dict(params or {})
+    last_error = None
 
-    if data.get("retCode") != 0:
+    for host in BYBIT_HOSTS:
+        try:
+            response = requests.get(
+                f"{host}{endpoint}",
+                params=params,
+                headers=REQUEST_HEADERS,
+                timeout=15,
+            )
+            if response.status_code == 403:
+                last_error = RuntimeError(
+                    f"403 Forbidden from {host}"
+                )
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get("retCode") != 0:
+                raise RuntimeError(
+                    f"Bybit error {data.get('retCode')}: "
+                    f"{data.get('retMsg')}"
+                )
+
+            _active_vendor = "bybit"
+            return data["result"]
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            last_error = exc
+            continue
+
+    try:
+        result = binance_market_result(endpoint, params)
+        _active_vendor = "binance"
+        return result
+    except Exception as exc:
         raise RuntimeError(
-            f"Bybit error {data.get('retCode')}: "
-            f"{data.get('retMsg')}"
-        )
-
-    return data["result"]
+            "Bybit blocked this host with HTTP 403 (common on "
+            "Streamlit Cloud / US IPs), and the Binance gold "
+            f"fallback also failed: {exc}"
+        ) from last_error
 
 
 def get_instrument():
@@ -955,7 +1133,7 @@ def render_market():
     left, right = st.columns([3, 1])
 
     with left:
-        st.write("**Instrument:** XAUTUSDT linear perpetual")
+        st.write("**Instrument:** XAUTUSDT or Binance PAXGUSDT linear perpetual")
         st.caption(
             "Last refresh: "
             + datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
@@ -971,10 +1149,18 @@ def render_market():
     # 3. Fetch, validate and analyze
     # --------------------------------------------------
     try:
-        with st.spinner("Connecting to Bybit..."):
+        with st.spinner("Connecting to market data..."):
             instrument = get_instrument()
             ticker = get_ticker()
             candles = add_indicators(get_candles())
+
+        if _active_vendor == "binance":
+            st.warning(
+                "Bybit returned HTTP 403 from this host, so the dashboard "
+                "is using Binance USDT-M **PAXGUSDT** public data instead. "
+                "Bybit blocks many US and cloud IPs. Your Windows copy can "
+                "still use Bybit XAUTUSDT when the local IP is allowed."
+            )
 
         if len(candles) < 60:
             st.warning(
